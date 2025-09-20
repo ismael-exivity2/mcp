@@ -1,36 +1,8 @@
 """
 Exivity MCP Server (FastMCP) — No JWT + SSL toggle + verbose debug
 ------------------------------------------------------------------
-A small, extensible MCP server that exposes tools for interacting with the
-Exivity REST API **without JWTs** (uses HTTP Basic Auth per request) and with a
-runtime **SSL verification toggle** (for lab/self-signed scenarios).
-
-Includes:
-- Debug prints in ExivityClient.request()
-- run_report tool that builds params, prints detailed diagnostics,
-  and calls the underlying HTTP client via a shared helper (preserving repeated keys)
-
-Requires:
-    pip install fastmcp httpx python-dotenv
-    # Optional (for HTTP hosting): pip install uvicorn
-
-Environment variables (preferred for secrets):
-    EXIVITY_BASE_URL      # e.g. https://api.exivity.com or your instance URL
-    EXIVITY_USERNAME      # basic auth username
-    EXIVITY_PASSWORD      # basic auth password
-    EXIVITY_SSL_VERIFY    # true/false (default: true). Set to false to DISABLE TLS verification.
-    EXIVITY_CA_BUNDLE     # path to custom CA bundle (overrides EXIVITY_SSL_VERIFY)
-
-Run (stdio MCP):
-    python exivity_mcp_server.py
-
-HTTP (optional) — if you want an ASGI app to serve via uvicorn:
-    uvicorn exivity_mcp_server:app --host 0.0.0.0 --port 8000
-
-Security note:
-- Disabling TLS verification exposes you to MITM attacks. Prefer using
-  EXIVITY_CA_BUNDLE to trust your internal/self-signed CA instead of disabling.
 """
+
 from __future__ import annotations
 
 import json
@@ -59,11 +31,10 @@ def _redact(val: Optional[str]) -> str:
         return ""
     if len(val) <= 3:
         return REDACTED
-    return f"{val[:1]}…{val[-1:]}"  # tiny preview only
+    return f"{val[:1]}…{val[-1:]}"
 
 
 def _parse_ssl_verify() -> Union[bool, str]:
-    """Return bool or CA bundle path for httpx verify=…"""
     if DEFAULT_CA_BUNDLE:
         return DEFAULT_CA_BUNDLE
     env = (os.getenv("EXIVITY_SSL_VERIFY", "true") or "true").strip().lower()
@@ -82,7 +53,7 @@ class ExivityConfig:
 
 
 class ExivityClient:
-    """Thin wrapper around httpx for the Exivity API (Basic Auth or Bearer) with SSL toggle."""
+    """Thin wrapper around httpx for the Exivity API."""
 
     def __init__(self, cfg: ExivityConfig):
         self.cfg = cfg
@@ -111,8 +82,6 @@ class ExivityClient:
         self.cfg.base_url = base_url.rstrip("/")
 
     def set_ssl_verify(self, enable: bool) -> None:
-        # If you previously set a CA bundle (string), calling set_ssl_verify(True)
-        # will switch back to bool(True). This is intentional here.
         self.cfg.ssl_verify = bool(enable)
         self._rebuild_client()
 
@@ -138,7 +107,31 @@ class ExivityClient:
             path = "/" + path
         url = f"{self.cfg.base_url}{path}"
 
-        hdrs = {"Accept": "application/json"}
+        # Determine best-effort Accept from params.format
+        accept = "*/*"
+        fmt = None
+        try:
+            if isinstance(params, dict):
+                fmt = params.get("format")
+            elif isinstance(params, list):
+                for k, v in params:
+                    if k == "format":
+                        fmt = v
+                        break
+        except Exception:
+            pass
+        if isinstance(fmt, bytes):
+            fmt = fmt.decode("utf-8", "ignore")
+        if isinstance(fmt, str):
+            f = fmt.lower()
+            if f.startswith("csv"):
+                accept = "text/csv, */*;q=0.8"
+            elif f.startswith("pdf"):
+                accept = "application/pdf, */*;q=0.8"
+            else:
+                accept = "application/json, */*;q=0.8"
+
+        hdrs = {"Accept": accept}
         if headers:
             hdrs.update(headers)
 
@@ -219,13 +212,11 @@ except Exception:
 
 @mcp.tool
 def ping() -> str:
-    """Simple health check for the MCP server itself."""
     return "pong"
 
 
 @mcp.tool
 def config() -> dict:
-    """Return current base URL, auth status, and TLS settings (redacted where needed)."""
     ca_bundle = _client.cfg.ssl_verify if isinstance(_client.cfg.ssl_verify, str) else None
     return {
         "base_url": _client.cfg.base_url,
@@ -241,60 +232,45 @@ def config() -> dict:
 
 @mcp.tool
 def set_base_url(base_url: str) -> dict:
-    """Set the Exivity API base URL. Example: https://api.exivity.com"""
     _client.set_base_url(base_url)
     return {"ok": True, "base_url": _client.cfg.base_url}
 
 
 @mcp.tool
 def set_basic_auth(username: str, password: str) -> dict:
-    """Configure HTTP Basic Auth (username + password)."""
     _client.set_basic_auth(username, password)
     return {"ok": True, "username_preview": _redact(_client.cfg.username)}
 
 
 @mcp.tool
 def clear_auth() -> dict:
-    """Clear any configured credentials from memory."""
     _client.clear_auth()
     return {"ok": True}
 
 
 @mcp.tool
 def set_ssl_verify(enable: bool) -> dict:
-    """Enable or disable TLS certificate verification for outbound Exivity calls.
-
-    SECURITY: Disabling verification is unsafe. Prefer set_ca_bundle() with a
-    trusted CA file instead of globally disabling verification.
-    """
     _client.set_ssl_verify(enable)
     return {"ok": True, "verify": bool(enable)}
 
 
 @mcp.tool
 def set_ca_bundle(ca_bundle_path: str) -> dict:
-    """Set a custom CA bundle file path for TLS verification (safer than disabling)."""
     _client.set_ca_bundle(ca_bundle_path)
     return {"ok": True, "ca_bundle": ca_bundle_path}
 
 
 @mcp.tool
 def set_token(token: Optional[str] = None) -> dict:
-    """Set JWT token for subsequent requests (Bearer)."""
     _client.set_token(token)
     return {"ok": True, "auth_mode": "Bearer" if token else "None"}
 
 
 @mcp.tool
 def get_token(username: str, password: str) -> dict:
-    """Get a JWT token from the Exivity API using username and password (form-encoded)."""
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
-    data = {
-        "username": username,
-        "password": password
-    }
+    data = {"username": username, "password": password}
     result = _client.request("POST", "/v1/auth/token", headers=headers, data=data)
-    # Auto-save if shape is {"token": "..."} or {"access_token": "..."}
     tok = None
     if isinstance(result, dict):
         tok = result.get("token") or result.get("access_token")
@@ -306,20 +282,12 @@ def get_token(username: str, password: str) -> dict:
 
 @mcp.tool
 def get(path: str, params: Optional[Union[Dict[str, Any], List[Tuple[str, Any]]]] = None) -> Dict[str, Any]:
-    """Perform a GET request to the Exivity API.
-
-    Args:
-        path: API path such as "/v1/reports" or "v1/accounts" (leading slash optional)
-        params: Optional query parameters (dict OR list of (key, value) tuples for repeated keys)
-    """
     return _get_impl(path, params=params)
 
 
 @mcp.tool
 def post(path: str, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Perform a POST request to the Exivity API with a JSON body."""
     result = _client.request("POST", path, json_body=body or {})
-    # Auto-save token from auth responses
     if isinstance(result, dict) and ("token" in result or "access_token" in result):
         print("DEBUG: Auto-saving token from POST response")
         _client.set_token(result.get("token") or result.get("access_token"))
@@ -328,14 +296,22 @@ def post(path: str, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
 
 @mcp.tool
 def put(path: str, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Perform a PUT request to the Exivity API with a JSON body."""
     return _client.request("PUT", path, json_body=body or {})
 
 
 @mcp.tool
 def delete(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Perform a DELETE request to the Exivity API."""
     return _client.request("DELETE", path, params=params)
+
+
+# --- helpers for run_report ---
+def _normalize_yyyy_mm_dd(s: Optional[str]) -> Optional[str]:
+    """Allow YYYYMMDD and convert to YYYY-MM-DD to match report examples."""
+    if not s:
+        return s
+    if len(s) == 8 and s.isdigit():
+        return f"{s[0:4]}-{s[4:6]}-{s[6:8]}"
+    return s
 
 
 @mcp.tool
@@ -350,24 +326,13 @@ def run_report(
     filters: Optional[Dict[str, Any]] = None,
     format: str = "json",
     precision: Optional[str] = None,
-    progress: Optional[int] = 1,
+    progress: Optional[int] = None,  # make optional (no default sent)
     csv_delimiter: Optional[str] = None,
     csv_decimal_separator: Optional[str] = None,
     summary_options: Optional[str] = None,
     extra_params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Troubleshooting version: builds params, prints debug info, and calls the HTTP client.
-
-    Endpoint:
-        GET /v1/reports/{report_id}/run
-
-    Notes:
-        - Preserves repeated keys by using a list of (key, value) tuples.
-        - 'include' accepts list or comma-separated string (sent as comma-separated).
-        - 'filters' is expanded to filter[key]=value (repeats for list) and also
-          supports nested ops like filter[cost][gte]=100 via dict values.
-        - 'extra_params' lets you pass raw keys (e.g., "filter[account_id]") directly.
-    """
+    """GET /v1/reports/{report_id}/run with robust param handling + debug."""
 
     def add(k: str, v: Any, out: List[Tuple[str, str]]) -> None:
         if v is None:
@@ -378,6 +343,10 @@ def run_report(
         else:
             out.append((k, str(v)))
 
+    # Normalize dates to YYYY-MM-DD (reports examples use dashed dates).  :contentReference[oaicite:2]{index=2}
+    start = _normalize_yyyy_mm_dd(start)
+    end = _normalize_yyyy_mm_dd(end)
+
     params: List[Tuple[str, str]] = []
     add("start", start, params)
     add("end", end, params)
@@ -385,7 +354,6 @@ def run_report(
     add("timeline", timeline, params)
     add("depth", depth, params)
 
-    # include (list or str) → comma-separated string
     if include is not None:
         include_str = include if isinstance(include, str) else ",".join(map(str, include))
         add("include", include_str, params)
@@ -398,9 +366,7 @@ def run_report(
     add("csv_decimal_separator", csv_decimal_separator, params)
     add("summary_options", summary_options, params)
 
-    # filters → filter[foo]=bar (repeat key for lists; nested ops allowed)
     if filters:
-        # Optional convenience: map deprecated parent_account_id → account_id
         if "parent_account_id" in filters and "account_id" not in filters:
             filters = dict(filters)
             filters["account_id"] = filters.pop("parent_account_id")
@@ -411,7 +377,6 @@ def run_report(
             else:
                 add(f"filter[{key}]", val, params)
 
-    # passthrough any raw/advanced params exactly as provided
     if extra_params:
         for k, v in extra_params.items():
             add(k, v, params)
@@ -444,9 +409,9 @@ def run_report(
         except Exception as enc_e:
             print(f"[run_report] (could not encode preview URL: {enc_e})")
 
-    # ---------- Call underlying HTTP client (do NOT call a tool from a tool) ----------
+    # ---------- Call underlying HTTP client ----------
     try:
-        resp = _get_impl(path, params=params)  # preserves repeated keys
+        resp = _get_impl(path, params=params)
         print(f"[run_report] response type     : {type(resp).__name__}")
         if isinstance(resp, dict):
             keys = list(resp.keys())
@@ -467,6 +432,5 @@ if __name__ == "__main__":
     if os.getenv("SELF_TEST"):
         print("[self-test] config ->")
         print(json.dumps(config(), indent=2))
-        # Intentionally no whoami() here (endpoint varies by deployment)
     else:
         mcp.run()
