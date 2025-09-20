@@ -8,7 +8,7 @@ runtime **SSL verification toggle** (for lab/self-signed scenarios).
 Includes:
 - Debug prints in ExivityClient.request()
 - run_report tool that builds params, prints detailed diagnostics,
-  and delegates to the existing get() tool (preserving repeated keys)
+  and calls the underlying HTTP client via a shared helper (preserving repeated keys)
 
 Requires:
     pip install fastmcp httpx python-dotenv
@@ -37,7 +37,7 @@ import json
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Union, Iterable, Tuple, List
+from typing import Any, Dict, Optional, Union, Tuple, List
 
 import httpx
 from fastmcp import FastMCP
@@ -206,6 +206,10 @@ class ExivityClient:
 mcp = FastMCP(name="Exivity MCP")
 _client = ExivityClient(ExivityConfig())
 
+# Shared GET implementation so tools don't call each other
+def _get_impl(path: str, params: Optional[Union[Dict[str, Any], List[Tuple[str, Any]]]] = None) -> Dict[str, Any]:
+    return _client.request("GET", path, params=params)
+
 # Expose an ASGI app for optional HTTP hosting
 try:
     app = mcp.streamable_http_app()
@@ -308,7 +312,7 @@ def get(path: str, params: Optional[Union[Dict[str, Any], List[Tuple[str, Any]]]
         path: API path such as "/v1/reports" or "v1/accounts" (leading slash optional)
         params: Optional query parameters (dict OR list of (key, value) tuples for repeated keys)
     """
-    return _client.request("GET", path, params=params)
+    return _get_impl(path, params=params)
 
 
 @mcp.tool
@@ -352,7 +356,7 @@ def run_report(
     summary_options: Optional[str] = None,
     extra_params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Troubleshooting version: builds params, prints debug info, and calls get().
+    """Troubleshooting version: builds params, prints debug info, and calls the HTTP client.
 
     Endpoint:
         GET /v1/reports/{report_id}/run
@@ -440,10 +444,9 @@ def run_report(
         except Exception as enc_e:
             print(f"[run_report] (could not encode preview URL: {enc_e})")
 
-        # ---------- Call underlying HTTP client (don’t call a tool from a tool) ----------
-        try:
-            resp = _client.request("GET", path, params=params)  # preserves repeated keys
-
+    # ---------- Call underlying HTTP client (do NOT call a tool from a tool) ----------
+    try:
+        resp = _get_impl(path, params=params)  # preserves repeated keys
         print(f"[run_report] response type     : {type(resp).__name__}")
         if isinstance(resp, dict):
             keys = list(resp.keys())
