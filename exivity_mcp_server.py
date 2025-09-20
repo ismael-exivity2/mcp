@@ -440,9 +440,10 @@ def run_report(
         except Exception as enc_e:
             print(f"[run_report] (could not encode preview URL: {enc_e})")
 
-    # ---------- Delegate to get() ----------
-    try:
-        resp = get(path, params=params)  # preserve repeated keys
+        # ---------- Call underlying HTTP client (don’t call a tool from a tool) ----------
+        try:
+            resp = _client.request("GET", path, params=params)  # preserves repeated keys
+
         print(f"[run_report] response type     : {type(resp).__name__}")
         if isinstance(resp, dict):
             keys = list(resp.keys())
