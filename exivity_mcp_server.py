@@ -1,9 +1,14 @@
 """
-Exivity MCP Server (FastMCP) — No JWT + SSL toggle
---------------------------------------------------
+Exivity MCP Server (FastMCP) — No JWT + SSL toggle + verbose debug
+------------------------------------------------------------------
 A small, extensible MCP server that exposes tools for interacting with the
 Exivity REST API **without JWTs** (uses HTTP Basic Auth per request) and with a
 runtime **SSL verification toggle** (for lab/self-signed scenarios).
+
+Includes:
+- Debug prints in ExivityClient.request()
+- run_report tool that builds params, prints detailed diagnostics,
+  and delegates to the existing get() tool (preserving repeated keys)
 
 Requires:
     pip install fastmcp httpx python-dotenv
@@ -32,7 +37,7 @@ import json
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Union, Iterable, Tuple, List
 
 import httpx
 from fastmcp import FastMCP
@@ -77,7 +82,7 @@ class ExivityConfig:
 
 
 class ExivityClient:
-    """Thin wrapper around httpx for the Exivity API (Basic Auth) with SSL toggle."""
+    """Thin wrapper around httpx for the Exivity API (Basic Auth or Bearer) with SSL toggle."""
 
     def __init__(self, cfg: ExivityConfig):
         self.cfg = cfg
@@ -106,6 +111,8 @@ class ExivityClient:
         self.cfg.base_url = base_url.rstrip("/")
 
     def set_ssl_verify(self, enable: bool) -> None:
+        # If you previously set a CA bundle (string), calling set_ssl_verify(True)
+        # will switch back to bool(True). This is intentional here.
         self.cfg.ssl_verify = bool(enable)
         self._rebuild_client()
 
@@ -122,7 +129,7 @@ class ExivityClient:
         method: str,
         path: str,
         *,
-        params: Optional[Dict[str, Any]] = None,
+        params: Optional[Union[Dict[str, Any], List[Tuple[str, Any]]]] = None,
         json_body: Optional[Dict[str, Any]] = None,
         headers: Optional[Dict[str, str]] = None,
         data: Optional[Dict[str, Any]] = None,
@@ -141,6 +148,15 @@ class ExivityClient:
         elif self.cfg.username and self.cfg.password:
             auth = httpx.BasicAuth(self.cfg.username, self.cfg.password)
 
+        # ---------- Debug: request line ----------
+        try:
+            from httpx import QueryParams
+            qp_str = f"?{QueryParams(params)}" if params else ""
+        except Exception:
+            qp_str = f" params={params!r}" if params else ""
+        auth_mode = "Bearer" if self.cfg.token else ("Basic" if (self.cfg.username and self.cfg.password) else "None")
+        tls_desc = self.cfg.ssl_verify if isinstance(self.cfg.ssl_verify, str) else ("verify=True" if self.cfg.ssl_verify else "verify=False")
+        print(f"[Exivity MCP][request] {method.upper()} {url}{qp_str}  tls={tls_desc}  auth={auth_mode}")
 
         last_exc: Optional[Exception] = None
         for attempt in range(3):
@@ -148,6 +164,7 @@ class ExivityClient:
                 resp = self._client.request(
                     method.upper(), url, params=params, json=json_body, data=data, headers=hdrs, auth=auth
                 )
+                print(f"[Exivity MCP][request] <- status={resp.status_code} content-type={resp.headers.get('content-type','')!r}")
                 if resp.status_code >= 400:
                     try:
                         err = resp.json()
@@ -174,8 +191,10 @@ class ExivityClient:
                     return {"text": resp.text}
             except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.RemoteProtocolError) as e:
                 last_exc = e
+                print(f"[Exivity MCP][request] transient error on attempt {attempt+1}: {e}")
                 time.sleep(0.5 * (attempt + 1))
             except httpx.RequestError as e:
+                print(f"[Exivity MCP][request] HTTP request error: {e}")
                 raise RuntimeError(f"HTTP request error: {e}") from e
         raise RuntimeError(f"HTTP request failed after retries: {last_exc}")
 
@@ -212,6 +231,7 @@ def config() -> dict:
             "verify": _client.cfg.ssl_verify if isinstance(_client.cfg.ssl_verify, bool) else True,
             "ca_bundle": ca_bundle,
         },
+        "auth_mode": "Bearer" if _client.cfg.token else ("Basic" if (_client.cfg.username and _client.cfg.password) else "None"),
     }
 
 
@@ -253,34 +273,40 @@ def set_ca_bundle(ca_bundle_path: str) -> dict:
     _client.set_ca_bundle(ca_bundle_path)
     return {"ok": True, "ca_bundle": ca_bundle_path}
 
+
 @mcp.tool
 def set_token(token: Optional[str] = None) -> dict:
-    """Set JWT token for subsequent requests."""
+    """Set JWT token for subsequent requests (Bearer)."""
     _client.set_token(token)
-    return {"ok": True}
+    return {"ok": True, "auth_mode": "Bearer" if token else "None"}
 
 
 @mcp.tool
 def get_token(username: str, password: str) -> dict:
-    """Get a JWT token from the Exivity API using username and password."""
+    """Get a JWT token from the Exivity API using username and password (form-encoded)."""
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
     data = {
         "username": username,
         "password": password
     }
     result = _client.request("POST", "/v1/auth/token", headers=headers, data=data)
-    if isinstance(result, dict) and "token" in result:
-        _client.set_token(result["token"])
+    # Auto-save if shape is {"token": "..."} or {"access_token": "..."}
+    tok = None
+    if isinstance(result, dict):
+        tok = result.get("token") or result.get("access_token")
+    if tok:
+        print("DEBUG: Auto-saving token from auth response")
+        _client.set_token(tok)
     return result
 
 
 @mcp.tool
-def get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def get(path: str, params: Optional[Union[Dict[str, Any], List[Tuple[str, Any]]]] = None) -> Dict[str, Any]:
     """Perform a GET request to the Exivity API.
 
     Args:
         path: API path such as "/v1/reports" or "v1/accounts" (leading slash optional)
-        params: Optional query parameters
+        params: Optional query parameters (dict OR list of (key, value) tuples for repeated keys)
     """
     return _client.request("GET", path, params=params)
 
@@ -290,9 +316,9 @@ def post(path: str, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Perform a POST request to the Exivity API with a JSON body."""
     result = _client.request("POST", path, json_body=body or {})
     # Auto-save token from auth responses
-    if isinstance(result, dict) and "token" in result:
-        print(f"DEBUG: Auto-saving token from response")
-        _client.set_token(result["token"])
+    if isinstance(result, dict) and ("token" in result or "access_token" in result):
+        print("DEBUG: Auto-saving token from POST response")
+        _client.set_token(result.get("token") or result.get("access_token"))
     return result
 
 
@@ -309,7 +335,6 @@ def delete(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
 
 
 @mcp.tool
-@mcp.tool
 def run_report(
     report_id: int,
     start: Optional[str] = None,
@@ -317,7 +342,7 @@ def run_report(
     dimension: Optional[str] = None,
     timeline: Optional[str] = None,
     depth: Optional[int] = None,
-    include: Optional[Union[str, list]] = None,
+    include: Optional[Union[str, List[str]]] = None,
     filters: Optional[Dict[str, Any]] = None,
     format: str = "json",
     precision: Optional[str] = None,
@@ -327,8 +352,20 @@ def run_report(
     summary_options: Optional[str] = None,
     extra_params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Thin wrapper that calls `get()` for GET /v1/reports/{report_id}/run."""
-    def add(k: str, v: Any, out: list):
+    """Troubleshooting version: builds params, prints debug info, and calls get().
+
+    Endpoint:
+        GET /v1/reports/{report_id}/run
+
+    Notes:
+        - Preserves repeated keys by using a list of (key, value) tuples.
+        - 'include' accepts list or comma-separated string (sent as comma-separated).
+        - 'filters' is expanded to filter[key]=value (repeats for list) and also
+          supports nested ops like filter[cost][gte]=100 via dict values.
+        - 'extra_params' lets you pass raw keys (e.g., "filter[account_id]") directly.
+    """
+
+    def add(k: str, v: Any, out: List[Tuple[str, str]]) -> None:
         if v is None:
             return
         if isinstance(v, (list, tuple, set)):
@@ -337,14 +374,14 @@ def run_report(
         else:
             out.append((k, str(v)))
 
-    params: list[tuple[str, str]] = []
+    params: List[Tuple[str, str]] = []
     add("start", start, params)
     add("end", end, params)
     add("dimension", dimension, params)
     add("timeline", timeline, params)
     add("depth", depth, params)
 
-    # include: accept list or string; API expects comma-separated string
+    # include (list or str) → comma-separated string
     if include is not None:
         include_str = include if isinstance(include, str) else ",".join(map(str, include))
         add("include", include_str, params)
@@ -357,9 +394,9 @@ def run_report(
     add("csv_decimal_separator", csv_decimal_separator, params)
     add("summary_options", summary_options, params)
 
-    # filters → filter[foo]=bar (repeat key for list values). Also support nested ops.
+    # filters → filter[foo]=bar (repeat key for lists; nested ops allowed)
     if filters:
-        # optional convenience: map deprecated parent_account_id → account_id
+        # Optional convenience: map deprecated parent_account_id → account_id
         if "parent_account_id" in filters and "account_id" not in filters:
             filters = dict(filters)
             filters["account_id"] = filters.pop("parent_account_id")
@@ -376,13 +413,56 @@ def run_report(
             add(k, v, params)
 
     path = f"/v1/reports/{report_id}/run"
-    # IMPORTANT: we pass the tuple list straight through so repeats are preserved
-    return get(path, params=params)
+
+    # ---------- Debug prints ----------
+    try:
+        from httpx import QueryParams
+    except Exception:
+        QueryParams = None  # type: ignore
+
+    print("\n[Exivity MCP][run_report] -------------------------------------------------")
+    print(f"[run_report] base_url          : { _client.cfg.base_url }")
+    auth_mode = "Bearer" if _client.cfg.token else ("Basic" if (_client.cfg.username and _client.cfg.password) else "None")
+    print(f"[run_report] auth_mode         : {auth_mode}")
+    print(f"[run_report] username_preview  : {_redact(_client.cfg.username)}")
+    if isinstance(_client.cfg.ssl_verify, bool):
+        print(f"[run_report] TLS verify        : { _client.cfg.ssl_verify }")
+    else:
+        print(f"[run_report] TLS CA bundle     : { _client.cfg.ssl_verify }")
+    print(f"[run_report] path              : {path}")
+    print(f"[run_report] params (raw list) : {params}")
+
+    if QueryParams is not None:
+        try:
+            qp = QueryParams(params)
+            print(f"[run_report] encoded query     : {str(qp)}")
+            print(f"[run_report] preview URL       : {_client.cfg.base_url}{path}?{qp}")
+        except Exception as enc_e:
+            print(f"[run_report] (could not encode preview URL: {enc_e})")
+
+    # ---------- Delegate to get() ----------
+    try:
+        resp = get(path, params=params)  # preserve repeated keys
+        print(f"[run_report] response type     : {type(resp).__name__}")
+        if isinstance(resp, dict):
+            keys = list(resp.keys())
+            print(f"[run_report] response keys     : {keys[:10]}")
+            if "error" in resp:
+                print(f"[run_report] response.error    : {str(resp['error'])[:300]}")
+        else:
+            print(f"[run_report] response preview  : {str(resp)[:300]}")
+        print("[Exivity MCP][run_report] ------------------------------- END -------------\n")
+        return resp
+    except Exception as e:
+        print(f"[run_report] EXCEPTION         : {e}")
+        print("[Exivity MCP][run_report] ------------------------------- END (ERROR) -----\n")
+        raise
 
 
 if __name__ == "__main__":
     if os.getenv("SELF_TEST"):
         print("[self-test] config ->")
         print(json.dumps(config(), indent=2))
+        # Intentionally no whoami() here (endpoint varies by deployment)
     else:
         mcp.run()
