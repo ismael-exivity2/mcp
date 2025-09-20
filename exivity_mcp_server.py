@@ -309,6 +309,7 @@ def delete(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
 
 
 @mcp.tool
+@mcp.tool
 def run_report(
     report_id: int,
     start: Optional[str] = None,
@@ -326,8 +327,8 @@ def run_report(
     summary_options: Optional[str] = None,
     extra_params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Run an Exivity report via GET /v1/reports/{report_id}/run with full query support."""
-    def _append(k: str, v: Any, out: list):
+    """Thin wrapper that calls `get()` for GET /v1/reports/{report_id}/run."""
+    def add(k: str, v: Any, out: list):
         if v is None:
             return
         if isinstance(v, (list, tuple, set)):
@@ -336,46 +337,47 @@ def run_report(
         else:
             out.append((k, str(v)))
 
-    query: list[tuple[str, str]] = []
-    _append("start", start, query)
-    _append("end", end, query)
-    _append("format", format, query)
-    if progress is not None:
-        _append("progress", progress, query)
-    _append("dimension", dimension, query)
-    _append("timeline", timeline, query)
-    _append("depth", depth, query)
-    _append("precision", precision, query)
-    _append("csv_delimiter", csv_delimiter, query)
-    _append("csv_decimal_separator", csv_decimal_separator, query)
-    _append("summary_options", summary_options, query)
+    params: list[tuple[str, str]] = []
+    add("start", start, params)
+    add("end", end, params)
+    add("dimension", dimension, params)
+    add("timeline", timeline, params)
+    add("depth", depth, params)
 
-    # include can be "a,b,c" or ["a","b","c"]; API expects comma-separated
+    # include: accept list or string; API expects comma-separated string
     if include is not None:
         include_str = include if isinstance(include, str) else ",".join(map(str, include))
-        _append("include", include_str, query)
+        add("include", include_str, params)
 
-    # filters → filter[foo]=bar  (repeat key if list)
+    add("format", format, params)
+    add("precision", precision, params)
+    if progress is not None:
+        add("progress", progress, params)
+    add("csv_delimiter", csv_delimiter, params)
+    add("csv_decimal_separator", csv_decimal_separator, params)
+    add("summary_options", summary_options, params)
+
+    # filters → filter[foo]=bar (repeat key for list values). Also support nested ops.
     if filters:
-        # Map deprecated parent_account_id → account_id if present
+        # optional convenience: map deprecated parent_account_id → account_id
         if "parent_account_id" in filters and "account_id" not in filters:
-            filters = dict(filters)  # shallow copy
+            filters = dict(filters)
             filters["account_id"] = filters.pop("parent_account_id")
         for key, val in filters.items():
             if isinstance(val, dict):
-                # allow advanced syntax like {"gte": 1, "lte": 5} → filter[key][gte]=1 ...
                 for op, v in val.items():
-                    _append(f"filter[{key}][{op}]", v, query)
+                    add(f"filter[{key}][{op}]", v, params)
             else:
-                _append(f"filter[{key}]", val, query)
+                add(f"filter[{key}]", val, params)
 
-    # extra passthrough (last-wins if keys collide)
+    # passthrough any raw/advanced params exactly as provided
     if extra_params:
         for k, v in extra_params.items():
-            _append(k, v, query)
+            add(k, v, params)
 
     path = f"/v1/reports/{report_id}/run"
-    return _client.request("GET", path, params=query)
+    # IMPORTANT: we pass the tuple list straight through so repeats are preserved
+    return get(path, params=params)
 
 
 if __name__ == "__main__":
