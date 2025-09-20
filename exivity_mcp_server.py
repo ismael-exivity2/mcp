@@ -306,7 +306,7 @@ def delete(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
 
 # --- helpers for run_report ---
 def _normalize_yyyy_mm_dd(s: Optional[str]) -> Optional[str]:
-    """Allow YYYYMMDD and convert to YYYY-MM-DD to match report examples."""
+    """Allow YYYYMMDD and convert to YYYY-MM-DD."""
     if not s:
         return s
     if len(s) == 8 and s.isdigit():
@@ -326,13 +326,18 @@ def run_report(
     filters: Optional[Dict[str, Any]] = None,
     format: str = "json",
     precision: Optional[str] = None,
-    progress: Optional[int] = None,  # make optional (no default sent)
+    progress: Optional[int] = None,  # optional: not sent if None
     csv_delimiter: Optional[str] = None,
     csv_decimal_separator: Optional[str] = None,
     summary_options: Optional[str] = None,
     extra_params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """GET /v1/reports/{report_id}/run with robust param handling + debug."""
+    """
+    GET /v1/reports/{report_id}/run with robust param handling + debug.
+
+    Change: Do NOT force date normalization. Try raw dates first (e.g., YYYYMMDD),
+    then retry once with normalized YYYY-MM-DD if the first attempt fails.
+    """
 
     def add(k: str, v: Any, out: List[Tuple[str, str]]) -> None:
         if v is None:
@@ -343,89 +348,99 @@ def run_report(
         else:
             out.append((k, str(v)))
 
-    # Normalize dates to YYYY-MM-DD (reports examples use dashed dates).  :contentReference[oaicite:2]{index=2}
-    start = _normalize_yyyy_mm_dd(start)
-    end = _normalize_yyyy_mm_dd(end)
+    # Preserve originals for fallback
+    orig_start, orig_end = start, end
 
-    params: List[Tuple[str, str]] = []
-    add("start", start, params)
-    add("end", end, params)
-    add("dimension", dimension, params)
-    add("timeline", timeline, params)
-    add("depth", depth, params)
+    def build_params(use_normalized: bool) -> List[Tuple[str, str]]:
+        p: List[Tuple[str, str]] = []
+        s = _normalize_yyyy_mm_dd(orig_start) if use_normalized else orig_start
+        e = _normalize_yyyy_mm_dd(orig_end) if use_normalized else orig_end
 
-    if include is not None:
-        include_str = include if isinstance(include, str) else ",".join(map(str, include))
-        add("include", include_str, params)
+        add("start", s, p)
+        add("end", e, p)
+        add("dimension", dimension, p)
+        add("timeline", timeline, p)
+        add("depth", depth, p)
 
-    add("format", format, params)
-    add("precision", precision, params)
-    if progress is not None:
-        add("progress", progress, params)
-    add("csv_delimiter", csv_delimiter, params)
-    add("csv_decimal_separator", csv_decimal_separator, params)
-    add("summary_options", summary_options, params)
+        if include is not None:
+            include_str = include if isinstance(include, str) else ",".join(map(str, include))
+            add("include", include_str, p)
 
-    if filters:
-        if "parent_account_id" in filters and "account_id" not in filters:
-            filters = dict(filters)
-            filters["account_id"] = filters.pop("parent_account_id")
-        for key, val in filters.items():
-            if isinstance(val, dict):
-                for op, v in val.items():
-                    add(f"filter[{key}][{op}]", v, params)
-            else:
-                add(f"filter[{key}]", val, params)
+        add("format", format, p)
+        add("precision", precision, p)
+        if progress is not None:
+            add("progress", progress, p)
+        add("csv_delimiter", csv_delimiter, p)
+        add("csv_decimal_separator", csv_decimal_separator, p)
+        add("summary_options", summary_options, p)
 
-    if extra_params:
-        for k, v in extra_params.items():
-            add(k, v, params)
+        # filters -> filter[key] or filter[key][op]
+        if filters:
+            f = dict(filters)
+            if "parent_account_id" in f and "account_id" not in f:
+                f["account_id"] = f.pop("parent_account_id")
+            for key, val in f.items():
+                if isinstance(val, dict):
+                    for op, v in val.items():
+                        add(f"filter[{key}][{op}]", v, p)
+                else:
+                    add(f"filter[{key}]", val, p)
+
+        if extra_params:
+            for k, v in extra_params.items():
+                add(k, v, p)
+
+        return p
 
     path = f"/v1/reports/{report_id}/run"
 
-    # ---------- Debug prints ----------
-    try:
-        from httpx import QueryParams
-    except Exception:
-        QueryParams = None  # type: ignore
-
-    print("\n[Exivity MCP][run_report] -------------------------------------------------")
-    print(f"[run_report] base_url          : { _client.cfg.base_url }")
-    auth_mode = "Bearer" if _client.cfg.token else ("Basic" if (_client.cfg.username and _client.cfg.password) else "None")
-    print(f"[run_report] auth_mode         : {auth_mode}")
-    print(f"[run_report] username_preview  : {_redact(_client.cfg.username)}")
-    if isinstance(_client.cfg.ssl_verify, bool):
-        print(f"[run_report] TLS verify        : { _client.cfg.ssl_verify }")
-    else:
-        print(f"[run_report] TLS CA bundle     : { _client.cfg.ssl_verify }")
-    print(f"[run_report] path              : {path}")
-    print(f"[run_report] params (raw list) : {params}")
-
-    if QueryParams is not None:
+    def debug_print(params: List[Tuple[str, str]], label: str) -> None:
         try:
+            from httpx import QueryParams
             qp = QueryParams(params)
-            print(f"[run_report] encoded query     : {str(qp)}")
-            print(f"[run_report] preview URL       : {_client.cfg.base_url}{path}?{qp}")
-        except Exception as enc_e:
-            print(f"[run_report] (could not encode preview URL: {enc_e})")
-
-    # ---------- Call underlying HTTP client ----------
-    try:
-        resp = _get_impl(path, params=params)
-        print(f"[run_report] response type     : {type(resp).__name__}")
-        if isinstance(resp, dict):
-            keys = list(resp.keys())
-            print(f"[run_report] response keys     : {keys[:10]}")
-            if "error" in resp:
-                print(f"[run_report] response.error    : {str(resp['error'])[:300]}")
+            qp_str = str(qp)
+        except Exception:
+            qp_str = repr(params)
+        print("\n[Exivity MCP][run_report] -------------------------------------------------")
+        print(f"[run_report] base_url          : {_client.cfg.base_url}")
+        auth_mode = "Bearer" if _client.cfg.token else ("Basic" if (_client.cfg.username and _client.cfg.password) else "None")
+        print(f"[run_report] auth_mode         : {auth_mode}")
+        print(f"[run_report] username_preview  : {_redact(_client.cfg.username)}")
+        if isinstance(_client.cfg.ssl_verify, bool):
+            print(f"[run_report] TLS verify        : {_client.cfg.ssl_verify}")
         else:
-            print(f"[run_report] response preview  : {str(resp)[:300]}")
-        print("[Exivity MCP][run_report] ------------------------------- END -------------\n")
-        return resp
-    except Exception as e:
-        print(f"[run_report] EXCEPTION         : {e}")
-        print("[Exivity MCP][run_report] ------------------------------- END (ERROR) -----\n")
-        raise
+            print(f"[run_report] TLS CA bundle     : {_client.cfg.ssl_verify}")
+        print(f"[run_report] path              : {path}")
+        print(f"[run_report] attempt           : {label}")
+        print(f"[run_report] params (raw list) : {params}")
+        print(f"[run_report] encoded query     : {qp_str}")
+        print(f"[run_report] preview URL       : {_client.cfg.base_url}{path}?{qp_str}")
+
+    last_exc: Optional[Exception] = None
+    # Try raw dates first (YYYYMMDD if provided), then normalized (YYYY-MM-DD)
+    for use_normalized, label in ((False, "raw-dates"), (True, "normalized-dates")):
+        params = build_params(use_normalized)
+        debug_print(params, label)
+        try:
+            resp = _get_impl(path, params=params)
+            print(f"[run_report] response type     : {type(resp).__name__}")
+            if isinstance(resp, dict):
+                keys = list(resp.keys())
+                print(f"[run_report] response keys     : {keys[:10]}")
+                if "error" in resp:
+                    print(f"[run_report] response.error    : {str(resp['error'])[:300]}")
+            else:
+                print(f"[run_report] response preview  : {str(resp)[:300]}")
+            print("[Exivity MCP][run_report] ------------------------------- END -------------\n")
+            return resp
+        except Exception as e:
+            last_exc = e
+            print(f"[run_report] attempt {label} failed: {e}")
+            print("[Exivity MCP][run_report] ------------------------------- RETRY ----------")
+
+    print("[run_report] EXCEPTION (both attempts failed)")
+    print("[Exivity MCP][run_report] ------------------------------- END (ERROR) -----\n")
+    raise last_exc if last_exc else RuntimeError("run_report failed without exception")
 
 
 if __name__ == "__main__":
