@@ -1,6 +1,6 @@
 """
-Exivity MCP Server (FastMCP) — No JWT + SSL toggle + verbose debug
-------------------------------------------------------------------
+Exivity MCP Server (FastMCP)
+----------------------------
 """
 
 from __future__ import annotations
@@ -24,6 +24,72 @@ DEFAULT_PASSWORD = os.getenv("EXIVITY_PASSWORD")
 DEFAULT_CA_BUNDLE = os.getenv("EXIVITY_CA_BUNDLE")
 
 REDACTED = "***REDACTED***"
+
+# ----------------------
+# FOCUS Schema Constants
+# ----------------------
+
+# Standard FOCUS 1.0 Columns (subset of commonly used ones + core identifiers)
+FOCUS_COLUMNS = [
+    "BillingPeriodStart",
+    "BillingPeriodEnd",
+    "BillingAccountName",
+    "BillingAccountId",
+    "BilledCost",
+    "BillingCurrency",
+    "ProviderName",
+    "RegionName",
+    "AvailabilityZone",
+    "ServiceName",
+    "ResourceName",
+    "ResourceId",
+    "UsageType",
+    "UsageUnit",
+    "UsageQuantity",
+    "ListCost",
+    "EffectiveCost",
+    "PricingUnit",
+    "SkuId",
+    "ChargeType",
+    "ChargeDescription",
+]
+
+# Default best-effort mapping from common Exivity/Cloud fields to FOCUS
+DEFAULT_FOCUS_MAPPING = {
+    # Cost
+    "total_charge": "BilledCost",
+    "subtotal_charge": "ListCost",  # Approximation
+    "total_cogs": "ContractedCost",  # Approximation
+    "unit_based_subtotal_charge": "ListCost",
+    # Identifiers
+    "account_id": "BillingAccountId",
+    "account_name": "BillingAccountName",
+    "account_key": "SubAccountId",  # Often used as sub-identifier
+    # Resource / Service
+    "service_description": "ServiceName",
+    "service_key": "SkuId",
+    "servicecategory_name": "ServiceCategory",
+    "service_id": "ResourceId",
+    # Quantities
+    "total_quantity": "UsageQuantity",
+    "subtotal_quantity": "PricingQuantity",
+    # Rates
+    "avg_unit_based_rate": "ListUnitPrice",
+    # Dates
+    "start_date": "BillingPeriodStart",
+    "end_date": "BillingPeriodEnd",
+    # Fallbacks / Legacy
+    "cost": "BilledCost",
+    "usage": "UsageQuantity",
+    "date": "BillingPeriodStart",
+    "account": "BillingAccountName",
+    "service": "ServiceName",
+    "resource": "ResourceName",
+    "region": "RegionName",
+    "zone": "AvailabilityZone",
+    "provider": "ProviderName",
+    "currency": "BillingCurrency",
+}
 
 
 def _redact(val: Optional[str]) -> str:
@@ -144,20 +210,39 @@ class ExivityClient:
         # ---------- Debug: request line ----------
         try:
             from httpx import QueryParams
+
             qp_str = f"?{QueryParams(params)}" if params else ""
         except Exception:
             qp_str = f" params={params!r}" if params else ""
-        auth_mode = "Bearer" if self.cfg.token else ("Basic" if (self.cfg.username and self.cfg.password) else "None")
-        tls_desc = self.cfg.ssl_verify if isinstance(self.cfg.ssl_verify, str) else ("verify=True" if self.cfg.ssl_verify else "verify=False")
-        print(f"[Exivity MCP][request] {method.upper()} {url}{qp_str}  tls={tls_desc}  auth={auth_mode}")
+        auth_mode = (
+            "Bearer"
+            if self.cfg.token
+            else ("Basic" if (self.cfg.username and self.cfg.password) else "None")
+        )
+        tls_desc = (
+            self.cfg.ssl_verify
+            if isinstance(self.cfg.ssl_verify, str)
+            else ("verify=True" if self.cfg.ssl_verify else "verify=False")
+        )
+        print(
+            f"[Exivity MCP][request] {method.upper()} {url}{qp_str}  tls={tls_desc}  auth={auth_mode}"
+        )
 
         last_exc: Optional[Exception] = None
         for attempt in range(3):
             try:
                 resp = self._client.request(
-                    method.upper(), url, params=params, json=json_body, data=data, headers=hdrs, auth=auth
+                    method.upper(),
+                    url,
+                    params=params,
+                    json=json_body,
+                    data=data,
+                    headers=hdrs,
+                    auth=auth,
                 )
-                print(f"[Exivity MCP][request] <- status={resp.status_code} content-type={resp.headers.get('content-type','')!r}")
+                print(
+                    f"[Exivity MCP][request] <- status={resp.status_code} content-type={resp.headers.get('content-type', '')!r}"
+                )
                 if resp.status_code >= 400:
                     try:
                         err = resp.json()
@@ -182,9 +267,15 @@ class ExivityClient:
                     return resp.json()
                 except Exception:
                     return {"text": resp.text}
-            except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.RemoteProtocolError) as e:
+            except (
+                httpx.ReadTimeout,
+                httpx.ConnectTimeout,
+                httpx.RemoteProtocolError,
+            ) as e:
                 last_exc = e
-                print(f"[Exivity MCP][request] transient error on attempt {attempt+1}: {e}")
+                print(
+                    f"[Exivity MCP][request] transient error on attempt {attempt + 1}: {e}"
+                )
                 time.sleep(0.5 * (attempt + 1))
             except httpx.RequestError as e:
                 print(f"[Exivity MCP][request] HTTP request error: {e}")
@@ -199,9 +290,13 @@ class ExivityClient:
 mcp = FastMCP(name="Exivity MCP")
 _client = ExivityClient(ExivityConfig())
 
+
 # Shared GET implementation so tools don't call each other
-def _get_impl(path: str, params: Optional[Union[Dict[str, Any], List[Tuple[str, Any]]]] = None) -> Dict[str, Any]:
+def _get_impl(
+    path: str, params: Optional[Union[Dict[str, Any], List[Tuple[str, Any]]]] = None
+) -> Dict[str, Any]:
     return _client.request("GET", path, params=params)
+
 
 # Expose an ASGI app for optional HTTP hosting
 try:
@@ -217,16 +312,22 @@ def ping() -> str:
 
 @mcp.tool
 def config() -> dict:
-    ca_bundle = _client.cfg.ssl_verify if isinstance(_client.cfg.ssl_verify, str) else None
+    ca_bundle = (
+        _client.cfg.ssl_verify if isinstance(_client.cfg.ssl_verify, str) else None
+    )
     return {
         "base_url": _client.cfg.base_url,
         "basic_auth": bool(_client.cfg.username and _client.cfg.password),
         "username_preview": _redact(_client.cfg.username),
         "tls": {
-            "verify": _client.cfg.ssl_verify if isinstance(_client.cfg.ssl_verify, bool) else True,
+            "verify": _client.cfg.ssl_verify
+            if isinstance(_client.cfg.ssl_verify, bool)
+            else True,
             "ca_bundle": ca_bundle,
         },
-        "auth_mode": "Bearer" if _client.cfg.token else ("Basic" if (_client.cfg.username and _client.cfg.password) else "None"),
+        "auth_mode": "Bearer"
+        if _client.cfg.token
+        else ("Basic" if (_client.cfg.username and _client.cfg.password) else "None"),
     }
 
 
@@ -281,7 +382,9 @@ def get_token(username: str, password: str) -> dict:
 
 
 @mcp.tool
-def get(path: str, params: Optional[Union[Dict[str, Any], List[Tuple[str, Any]]]] = None) -> Dict[str, Any]:
+def get(
+    path: str, params: Optional[Union[Dict[str, Any], List[Tuple[str, Any]]]] = None
+) -> Dict[str, Any]:
     return _get_impl(path, params=params)
 
 
@@ -314,8 +417,7 @@ def _normalize_yyyy_mm_dd(s: Optional[str]) -> Optional[str]:
     return s
 
 
-@mcp.tool
-def run_report(
+def _run_report_impl(
     report_id: int,
     start: Optional[str] = None,
     end: Optional[str] = None,
@@ -326,18 +428,13 @@ def run_report(
     filters: Optional[Dict[str, Any]] = None,
     format: str = "json",
     precision: Optional[str] = None,
-    progress: Optional[int] = None,  # optional: not sent if None
+    progress: Optional[int] = None,
     csv_delimiter: Optional[str] = None,
     csv_decimal_separator: Optional[str] = None,
     summary_options: Optional[str] = None,
     extra_params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """
-    GET /v1/reports/{report_id}/run with robust param handling + debug.
-
-    Change: Do NOT force date normalization. Try raw dates first (e.g., YYYYMMDD),
-    then retry once with normalized YYYY-MM-DD if the first attempt fails.
-    """
+    """Helper implementing the logic for GET /v1/reports/{report_id}/run."""
 
     def add(k: str, v: Any, out: List[Tuple[str, str]]) -> None:
         if v is None:
@@ -363,7 +460,9 @@ def run_report(
         add("depth", depth, p)
 
         if include is not None:
-            include_str = include if isinstance(include, str) else ",".join(map(str, include))
+            include_str = (
+                include if isinstance(include, str) else ",".join(map(str, include))
+            )
             add("include", include_str, p)
 
         add("format", format, p)
@@ -397,13 +496,22 @@ def run_report(
     def debug_print(params: List[Tuple[str, str]], label: str) -> None:
         try:
             from httpx import QueryParams
+
             qp = QueryParams(params)
             qp_str = str(qp)
         except Exception:
             qp_str = repr(params)
-        print("\n[Exivity MCP][run_report] -------------------------------------------------")
+        print(
+            "\n[Exivity MCP][run_report] -------------------------------------------------"
+        )
         print(f"[run_report] base_url          : {_client.cfg.base_url}")
-        auth_mode = "Bearer" if _client.cfg.token else ("Basic" if (_client.cfg.username and _client.cfg.password) else "None")
+        auth_mode = (
+            "Bearer"
+            if _client.cfg.token
+            else (
+                "Basic" if (_client.cfg.username and _client.cfg.password) else "None"
+            )
+        )
         print(f"[run_report] auth_mode         : {auth_mode}")
         print(f"[run_report] username_preview  : {_redact(_client.cfg.username)}")
         if isinstance(_client.cfg.ssl_verify, bool):
@@ -428,19 +536,196 @@ def run_report(
                 keys = list(resp.keys())
                 print(f"[run_report] response keys     : {keys[:10]}")
                 if "error" in resp:
-                    print(f"[run_report] response.error    : {str(resp['error'])[:300]}")
+                    print(
+                        f"[run_report] response.error    : {str(resp['error'])[:300]}"
+                    )
             else:
                 print(f"[run_report] response preview  : {str(resp)[:300]}")
-            print("[Exivity MCP][run_report] ------------------------------- END -------------\n")
+            print(
+                "[Exivity MCP][run_report] ------------------------------- END -------------\n"
+            )
             return resp
         except Exception as e:
             last_exc = e
             print(f"[run_report] attempt {label} failed: {e}")
-            print("[Exivity MCP][run_report] ------------------------------- RETRY ----------")
+            print(
+                "[Exivity MCP][run_report] ------------------------------- RETRY ----------"
+            )
 
     print("[run_report] EXCEPTION (both attempts failed)")
-    print("[Exivity MCP][run_report] ------------------------------- END (ERROR) -----\n")
+    print(
+        "[Exivity MCP][run_report] ------------------------------- END (ERROR) -----\n"
+    )
     raise last_exc if last_exc else RuntimeError("run_report failed without exception")
+
+
+@mcp.tool
+def run_report(
+    report_id: int,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    dimension: Optional[str] = None,
+    timeline: Optional[str] = None,
+    depth: Optional[int] = None,
+    include: Optional[Union[str, List[str]]] = None,
+    filters: Optional[Dict[str, Any]] = None,
+    format: str = "json",
+    precision: Optional[str] = None,
+    progress: Optional[int] = None,
+    csv_delimiter: Optional[str] = None,
+    csv_decimal_separator: Optional[str] = None,
+    summary_options: Optional[str] = None,
+    extra_params: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    GET /v1/reports/{report_id}/run with robust param handling + debug.
+
+    Change: Do NOT force date normalization. Try raw dates first (e.g., YYYYMMDD),
+    then retry once with normalized YYYY-MM-DD if the first attempt fails.
+    """
+    return _run_report_impl(
+        report_id=report_id,
+        start=start,
+        end=end,
+        dimension=dimension,
+        timeline=timeline,
+        depth=depth,
+        include=include,
+        filters=filters,
+        format=format,
+        precision=precision,
+        progress=progress,
+        csv_delimiter=csv_delimiter,
+        csv_decimal_separator=csv_decimal_separator,
+        summary_options=summary_options,
+        extra_params=extra_params,
+    )
+
+
+@mcp.tool
+def run_focus_report(
+    report_id: int,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    dimension: Optional[str] = None,
+    timeline: Optional[str] = None,
+    depth: Optional[int] = None,
+    include: Optional[Union[str, List[str]]] = None,
+    filters: Optional[Dict[str, Any]] = None,
+    precision: Optional[str] = None,
+    extra_params: Optional[Dict[str, Any]] = None,
+    custom_mapping: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """
+    Runs an Exivity report and transforms the result to the FinOps FOCUS schema (1.0).
+
+    Args:
+        report_id: ID of the report to run.
+        start: Start date (YYYYMMDD or YYYY-MM-DD).
+        end: End date (YYYYMMDD or YYYY-MM-DD).
+        dimension: Group by dimension.
+        timeline: Timeline granularity (day, month).
+        depth: Depth of the report.
+        include: Fields to include.
+        filters: Filters to apply.
+        precision: Precision of the output.
+        extra_params: Additional parameters.
+        custom_mapping: Optional dictionary to override default column mappings.
+                        Format: {'exivity_column': 'FOCUS_Column'}
+    """
+    # 1. Fetch raw data
+    # Force JSON format for parsing
+    # 1. Fetch raw data
+    # Force JSON format for parsing
+    # Automatically add dimensions and includes for richer data if not specified
+    if not dimension:
+        dimension = "accounts,services,instances"
+
+    if not include:
+        include = [
+            "account_key",
+            "account_name",
+            "service_key",
+            "service_description",
+            "servicecategory_name",
+            "start_date",
+            "end_date",
+        ]
+
+    raw_data = _run_report_impl(
+        report_id=report_id,
+        start=start,
+        end=end,
+        dimension=dimension,
+        timeline=timeline,
+        depth=depth,
+        include=include,
+        filters=filters,
+        format="json",  # Always JSON for transformation
+        precision=precision,
+        extra_params=extra_params,
+    )
+
+    # 2. Extract records
+    records = []
+    if isinstance(raw_data, list):
+        records = raw_data
+    elif isinstance(raw_data, dict):
+        # Handle common wrapper keys if present
+        if "data" in raw_data and isinstance(raw_data["data"], list):
+            records = raw_data["data"]
+        elif "result" in raw_data and isinstance(raw_data["result"], list):
+            records = raw_data["result"]
+        elif "rows" in raw_data and isinstance(raw_data["rows"], list):
+            records = raw_data["rows"]
+        else:
+            # Check if it's a dict of lists (case where keys are IDs)
+            found_lists = [v for v in raw_data.values() if isinstance(v, list)]
+            if found_lists:
+                for lst in found_lists:
+                    records.extend(lst)
+            else:
+                # Fallback: maybe the dict itself is the record?
+                records = [raw_data]
+
+    if not records:
+        return {"result": [], "metadata": {"status": "empty or unknown format"}}
+
+    # 3. Transform records
+    mapping = DEFAULT_FOCUS_MAPPING.copy()
+    if custom_mapping:
+        mapping.update(custom_mapping)
+
+    transformed_records = []
+    for row in records:
+        if not isinstance(row, dict):
+            continue
+
+        new_row = {}
+        # Apply mapping
+        for exivity_key, val in row.items():
+            focus_key = mapping.get(exivity_key)
+            if focus_key:
+                new_row[focus_key] = val
+            else:
+                # Keep original key if no mapping found (optional: or drop it?)
+                # FOCUS spec says we can have provider-specific cols, usually prefixed.
+                # We'll keep them as is for now or map to 'x_Exivity_<key>'?
+                # Better to keep them for context.
+                new_row[exivity_key] = val
+
+        # Ensure minimal set of FOCUS columns exist (nullable)
+        for col in FOCUS_COLUMNS:
+            if col not in new_row:
+                new_row[col] = None
+
+        transformed_records.append(new_row)
+
+    return {
+        "focus_version": "1.0",
+        "record_count": len(transformed_records),
+        "data": transformed_records,
+    }
 
 
 if __name__ == "__main__":
